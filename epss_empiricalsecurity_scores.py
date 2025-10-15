@@ -16,8 +16,12 @@ import urllib.request
 from datetime import datetime, date, timedelta
 
 # Configuration
-LOGFILE = "/tmp/epss_scroes_download.log"   # as requested
-DOWNLOAD_TO = "/tmp/epss_empiricalsecurity"
+# Base directory where the script will live and operate
+BASE_DIR = os.environ.get("EPSS_BASE", "/opt/lookup-generation/epss")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+LOGFILE = os.path.join(LOG_DIR, "epss_scores_download.log")
+DOWNLOAD_TO = DATA_DIR
 BASE_URL = "https://epss.empiricalsecurity.com"
 
 TODAY = date.today()
@@ -26,7 +30,8 @@ FILENAME = f"epss_scores-{DATE_STR}.csv.gz"
 FINAL_GZ = os.path.join(DOWNLOAD_TO, FILENAME)
 TMP_GZ = FINAL_GZ + ".part"
 EXTRACTED_CSV = os.path.join(DOWNLOAD_TO, "epss_score.csv")    # task 5 filename
-AGG_CSV = os.path.join(DOWNLOAD_TO, "epss_scores.csv")         # date-agnostic CSV
+AGG_CSV = os.path.join(BASE_DIR, "epss_scores.csv")         # date-agnostic CSV in base
+README_PATH = os.path.join(BASE_DIR, "README.txt")
 
 # Logging helpers
 def _now_ts() -> str:
@@ -49,17 +54,35 @@ def safe_remove(path: str) -> None:
     except Exception as e:
         log(f"warning: failed to remove {path}: {e}")
 
+# Ensure base directories exist before logging
+os.makedirs(BASE_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# create README describing the script (idempotent)
+try:
+    readme_text = (
+        "EPSS downloader and processor\n"
+        "This script downloads the daily EPSS scores .csv.gz into the 'data' directory,\n"
+        "extracts it, normalizes the data into a date-agnostic 'epss_scores.csv' file in the\n"
+        "base directory, archives older aggregated files, and logs activity to the 'logs' folder.\n"
+    )
+    with open(README_PATH, "w", encoding="utf-8") as rf:
+        rf.write(readme_text)
+except Exception:
+    # non-fatal; continue
+    pass
+
 # Start
 log("SCRIPT STARTED")
 
-# Task 1: ensure folder exists
+# Task 1: ensure folder exists (data & logs already created above)
 task = "TASK 1 - ensure download folder"
 log(f"{task}: STARTED")
 try:
-    os.makedirs(DOWNLOAD_TO, exist_ok=True)
-    log(f"{task}: OK - ensured {DOWNLOAD_TO} exists")
+    log(f"{task}: OK - ensured base dirs (base={BASE_DIR}, data={DATA_DIR}, logs={LOG_DIR})")
 except Exception as e:
-    fail(task, f"could not create/verify folder {DOWNLOAD_TO}: {e}")
+    fail(task, f"could not verify folders under {BASE_DIR}: {e}")
 
 # Task 2: remove previously downloaded older csv.gz files
 task = "TASK 2 - remove old .csv.gz files"
