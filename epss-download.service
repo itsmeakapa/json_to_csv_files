@@ -1,0 +1,11 @@
+[Unit]
+Description=Download EPSS daily file
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/json_to_csv_files
+ExecStart=/path/to/json_to_csv_files/download_epss_daily.sh
+
+[Install]
+WantedBy=multi-user.target
