@@ -189,6 +189,12 @@ try:
         fail(task, "final aggregated CSV contains no data rows (only header)")
     os.replace(tmp_agg, AGG_CSV)
     log(f"{task}: OK - created {AGG_CSV} (fixed header + values)")
+    # remove the extracted intermediate CSV to save space
+    try:
+        safe_remove(EXTRACTED_CSV)
+        log(f"{task}: OK - removed intermediate {EXTRACTED_CSV}")
+    except Exception as e:
+        log(f"{task}: warning: failed to remove intermediate {EXTRACTED_CSV}: {e}")
 except SystemExit:
     raise
 except Exception as e:
