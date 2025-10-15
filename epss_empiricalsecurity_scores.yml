@@ -1,0 +1,209 @@
+name: epss-empiricalsecurity-scores
+on:
+  workflow_dispatch: {}
+
+jobs:
+  download-and-process:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run EPSS YAML-driven shell tasks (tasks 0..8)
+        run: |
+          set -euo pipefail
+          LOGFILE="/tmp/epss_scroes_download.log"
+          DOWNLOAD_TO="/tmp/epss_empiricalsecurity"
+          BASE_URL="https://epss.empiricalsecurity.com"
+          DATE="$(date +%F)"                 # per spec: download today's file
+          FILENAME="epss_scores-${DATE}.csv.gz"
+          TMPFILE="${DOWNLOAD_TO}/${FILENAME}.part"
+          FINAL_GZ="${DOWNLOAD_TO}/${FILENAME}"
+          CSV_EXTRACT="${DOWNLOAD_TO}/epss_score.csv"    # task 5
+          AGGFILE="${DOWNLOAD_TO}/epss_scores.csv"       # date-agnostic output
+
+          log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >> "$LOGFILE"; }
+
+          # Task 0: start log
+          log "SCRIPT STARTED"
+
+          # ERR trap to log failure and where it happened
+          CURRENT_TASK="startup"
+          trap 'rc=$?; if [ $rc -ne 0 ]; then log "TERMINATED DURING ${CURRENT_TASK:-unknown} rc=$rc"; fi' ERR
+
+          # TASK 1: ensure directory exists
+          CURRENT_TASK="TASK 1 - ensure download folder"
+          log "$CURRENT_TASK: STARTED"
+          mkdir -p "$DOWNLOAD_TO" && log "$CURRENT_TASK: OK - ensured $DOWNLOAD_TO exists"
+
+          # TASK 2: remove previously downloaded older .csv.gz files
+          CURRENT_TASK="TASK 2 - remove old .csv.gz files"
+          log "$CURRENT_TASK: STARTED"
+          found_gz=0
+          for f in "$DOWNLOAD_TO"/*.csv.gz; do
+            [ -e "$f" ] || continue
+            found_gz=1
+            if rm -f -- "$f"; then
+              log "$CURRENT_TASK: removed $f"
+            else
+              log "$CURRENT_TASK: failed to remove $f"
+              exit 1
+            fi
+          done
+          if [ "$found_gz" -eq 0 ]; then
+            log "$CURRENT_TASK: OK - no .csv.gz files to remove"
+          else
+            log "$CURRENT_TASK: OK - removed existing .csv.gz files"
+          fi
+
+          # TASK 3: rotate existing epss_scores.csv -> epss_scores-YYYY-MM-DD.csv (mtime)
+          CURRENT_TASK="TASK 3 - rotate existing epss_scores.csv"
+          log "$CURRENT_TASK: STARTED"
+          if [ -f "$AGGFILE" ]; then
+            file_date=$(date -u -r "$AGGFILE" +%F)
+            dest="${DOWNLOAD_TO}/epss_scores-${file_date}.csv"
+            # avoid overwrite by suffix
+            if [ -e "$dest" ]; then
+              i=1
+              while [ -e "${dest}.${i}" ]; do i=$((i+1)); done
+              dest="${dest}.${i}"
+            fi
+            mv -f "$AGGFILE" "$dest"
+            log "$CURRENT_TASK: OK - moved $AGGFILE -> $dest"
+          else
+            log "$CURRENT_TASK: OK - $AGGFILE not present, nothing to rotate"
+          fi
+
+          # TASK 4: download today's file, wait 5s after finish, verify completeness if possible
+          CURRENT_TASK="TASK 4 - download today's .csv.gz"
+          log "$CURRENT_TASK: STARTED - url=${BASE_URL}/${FILENAME}"
+          URL="${BASE_URL}/${FILENAME}"
+          if ! command -v curl >/dev/null 2>&1; then
+            log "$CURRENT_TASK: FAILED - curl not available"
+            exit 1
+          fi
+          # Use curl -> tmp file then atomically move
+          if curl -fSL --retry 3 --retry-delay 5 --connect-timeout 10 -o "$TMPFILE" "$URL"; then
+            # verify if Content-Length available
+            header_cl=$(curl -sI "$URL" | awk 'BEGIN{IGNORECASE=1} /^Content-Length:/ {print $2}' | tr -d '\r')
+            bytes=$(wc -c < "$TMPFILE" | tr -d ' ')
+            if [ -n "$header_cl" ] && [ "$header_cl" != "$bytes" ]; then
+              log "$CURRENT_TASK: FAILED - incomplete download (expected ${header_cl} bytes, got ${bytes})"
+              rm -f "$TMPFILE" || true
+              exit 1
+            fi
+            mv -f "$TMPFILE" "$FINAL_GZ"
+            log "$CURRENT_TASK: OK - downloaded $URL -> $FINAL_GZ (${bytes:-unknown} bytes)"
+            log "$CURRENT_TASK: sleeping 5s after download"
+            sleep 5
+          else
+            log "$CURRENT_TASK: FAILED - curl failed to download $URL"
+            rm -f "$TMPFILE" || true
+            exit 1
+          fi
+
+          # TASK 5: extract the downloaded .csv.gz to epss_score.csv
+          CURRENT_TASK="TASK 5 - extract .csv.gz to epss_score.csv"
+          log "$CURRENT_TASK: STARTED"
+          if command -v gunzip >/dev/null 2>&1; then
+            if gunzip -c "$FINAL_GZ" > "$CSV_EXTRACT"; then
+              log "$CURRENT_TASK: OK - extracted -> $CSV_EXTRACT"
+            else
+              log "$CURRENT_TASK: FAILED - gunzip extraction failed"
+              exit 1
+            fi
+          elif command -v zcat >/dev/null 2>&1; then
+            if zcat "$FINAL_GZ" > "$CSV_EXTRACT"; then
+              log "$CURRENT_TASK: OK - extracted -> $CSV_EXTRACT"
+            else
+              log "$CURRENT_TASK: FAILED - zcat extraction failed"
+              exit 1
+            fi
+          elif command -v python3 >/dev/null 2>&1; then
+            if python3 - <<PY > /dev/null
+import gzip,shutil,sys
+with gzip.open("$FINAL_GZ",'rb') as f_in:
+    with open("$CSV_EXTRACT",'wb') as f_out:
+        shutil.copyfileobj(f_in,f_out)
+PY
+            then
+              log "$CURRENT_TASK: OK - extracted with python -> $CSV_EXTRACT"
+            else
+              log "$CURRENT_TASK: FAILED - python extraction failed"
+              exit 1
+            fi
+          else
+            log "$CURRENT_TASK: FAILED - no tool available to extract gzip"
+            exit 1
+          fi
+
+          # TASK 6: Create a Clean, Date-Agnostic CSV. Wait 5s and remove comment lines starting with '#'
+          CURRENT_TASK="TASK 6 - create date-agnostic CSV"
+          log "$CURRENT_TASK: STARTED"
+          sleep 5
+          TMP_AGG="${AGGFILE}.part"
+          # Filter out lines starting with '#'
+          if ! grep -v '^#' "$CSV_EXTRACT" > "$TMP_AGG"; then
+            log "$CURRENT_TASK: FAILED - grep/filtering failed"
+            rm -f "$TMP_AGG" || true
+            exit 1
+          fi
+          DATA_COUNT=$(wc -l < "$TMP_AGG" | tr -d ' ' || echo 0)
+          if [ "$DATA_COUNT" -lt 1 ]; then
+            log "$CURRENT_TASK: FAILED - no data rows after removing comments"
+            rm -f "$TMP_AGG" || true
+            exit 1
+          fi
+          # Create fixed header then append data rows (skip original header)
+          TMP_FINAL="${AGGFILE}.part2"
+          printf 'cve,epss,percentile\n' > "$TMP_FINAL"
+          tail -n +2 "$TMP_AGG" >> "$TMP_FINAL" || true
+          FINAL_LINES=$(wc -l < "$TMP_FINAL" | tr -d ' ' || echo 0)
+          if [ "$FINAL_LINES" -lt 2 ]; then
+            log "$CURRENT_TASK: FAILED - final aggregated file contains no data rows"
+            rm -f "$TMP_AGG" "$TMP_FINAL" || true
+            exit 1
+          fi
+          mv -f "$TMP_FINAL" "$AGGFILE"
+          rm -f "$TMP_AGG" || true
+          log "$CURRENT_TASK: OK - created $AGGFILE (fixed header + values)"
+
+          # TASK 7: remove the csv.gz file to save disk space
+          CURRENT_TASK="TASK 7 - remove downloaded .csv.gz"
+          log "$CURRENT_TASK: STARTED"
+          if [ -f "$FINAL_GZ" ]; then
+            rm -f "$FINAL_GZ" && log "$CURRENT_TASK: OK - removed $FINAL_GZ"
+          else
+            log "$CURRENT_TASK: OK - $FINAL_GZ not present"
+          fi
+
+          # TASK 8: keep only two files: epss_scores.csv and yesterday's epss_scores-YYYY-MM-DD.csv, remove older dated files
+          CURRENT_TASK="TASK 8 - prune older dated epss_scores-YYYY-MM-DD.csv files"
+          log "$CURRENT_TASK: STARTED"
+          YESTERDAY="$(date -d 'yesterday' +%F)"
+          KEEP_NAME="epss_scores-${YESTERDAY}.csv"
+          removed_list=""
+          for f in "$DOWNLOAD_TO"/epss_scores-*.csv; do
+            [ -e "$f" ] || continue
+            bn="$(basename "$f")"
+            if [ "$bn" = "epss_scores.csv" ]; then
+              continue
+            fi
+            if [ "$bn" = "$KEEP_NAME" ]; then
+              log "$CURRENT_TASK: keeping $bn"
+              continue
+            fi
+            if rm -f -- "$f"; then
+              removed_list="${removed_list:+$removed_list, }$bn"
+            else
+              log "$CURRENT_TASK: failed to remove $f"
+            fi
+          done
+          if [ -n "$removed_list" ]; then
+            log "$CURRENT_TASK: OK - removed older dated files: $removed_list"
+          else
+            log "$CURRENT_TASK: OK - no extra dated files to remove"
+          fi
+
+          # Finished
+          CURRENT_TASK="finish"
+          log "SCRIPT FINISHED SUCCESSFULLY"
+          log "SCRIPT COMPLETED AT $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        shell: bash
